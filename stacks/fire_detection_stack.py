@@ -39,6 +39,15 @@ from aws_cdk import (
 from aws_cdk import custom_resources as cr
 from constructs import Construct
 
+from reference_producer.image_gen_config import (
+    DEFAULT_FORMAT,
+    DEFAULT_HEIGHT_PIXELS,
+    DEFAULT_IMAGE_SELECTOR_TYPE,
+    DEFAULT_JPEG_QUALITY,
+    DEFAULT_WIDTH_PIXELS,
+    build_image_generation_payload,
+)
+
 
 class FireDetectionStack(Stack):
     """Single stack: KMS CMK, KVS stream, S3 bucket, SNS topic, SSM
@@ -203,6 +212,98 @@ class FireDetectionStack(Stack):
                 resources=[self.cmk.key_arn],
             )
         )
+
+        # ------------------------------------------------------------------
+        # Real-time image generation configuration -- applies the
+        # documented ImageGenerationConfiguration (KVS Developer Guide,
+        # "Automated real-time image generation", p.245-246) to the
+        # stream above via a custom resource that calls
+        # kinesisvideo:UpdateImageGenerationConfiguration (there is no
+        # native CloudFormation resource type for this setting). The
+        # payload is built by the same
+        # ``reference_producer.image_gen_config.build_image_generation_payload``
+        # helper used by the standalone CLI/script path, so both paths
+        # produce byte-for-byte the same shape and the 200ms
+        # SamplingInterval floor is enforced in exactly one place.
+        #
+        # IMPORTANT (see reference_producer/image_gen_config.py for the
+        # full detail, sourced from p.246-247 of the KVS Developer
+        # Guide):
+        #   * KVS only generates/delivers images for fragments tagged
+        #     with the mandatory MKV simple tag
+        #     AWS_KINESISVIDEO_IMAGE_GENERATION -- the reference
+        #     producer is responsible for setting this tag on every
+        #     fragment it pushes via putKinesisVideoEventMetadata.
+        #   * It takes >= 60 seconds for KVS to initiate the
+        #     image-generation workflow after this configuration is
+        #     applied. Any producer (including reference_producer.py)
+        #     MUST wait at least that long after stack deployment
+        #     before pushing video to this stream.
+        # ------------------------------------------------------------------
+        image_generation_payload = build_image_generation_payload(
+            self.kvs_stream.name,
+            f"s3://{self.image_bucket.bucket_name}",
+            self.region,
+            sampling_interval_ms=image_sampling_interval_ms,
+            image_selector_type=DEFAULT_IMAGE_SELECTOR_TYPE,
+            image_format=DEFAULT_FORMAT,
+            jpeg_quality=DEFAULT_JPEG_QUALITY,
+            width_pixels=DEFAULT_WIDTH_PIXELS,
+            height_pixels=DEFAULT_HEIGHT_PIXELS,
+        )
+        self.image_generation_payload = image_generation_payload
+
+        image_generation_physical_id = cr.PhysicalResourceId.of(
+            f"{self.stack_name}-ImageGenerationConfig"
+        )
+        self.image_generation_config = cr.AwsCustomResource(
+            self,
+            "ImageGenerationConfig",
+            on_create=cr.AwsSdkCall(
+                service="KinesisVideo",
+                action="updateImageGenerationConfiguration",
+                parameters={
+                    "StreamName": image_generation_payload["StreamName"],
+                    "ImageGenerationConfiguration": image_generation_payload[
+                        "ImageGenerationConfiguration"
+                    ],
+                },
+                physical_resource_id=image_generation_physical_id,
+            ),
+            on_update=cr.AwsSdkCall(
+                service="KinesisVideo",
+                action="updateImageGenerationConfiguration",
+                parameters={
+                    "StreamName": image_generation_payload["StreamName"],
+                    "ImageGenerationConfiguration": image_generation_payload[
+                        "ImageGenerationConfiguration"
+                    ],
+                },
+                physical_resource_id=image_generation_physical_id,
+            ),
+            on_delete=cr.AwsSdkCall(
+                service="KinesisVideo",
+                action="updateImageGenerationConfiguration",
+                parameters={
+                    "StreamName": image_generation_payload["StreamName"],
+                    "ImageGenerationConfiguration": {
+                        **image_generation_payload["ImageGenerationConfiguration"],
+                        "Status": "DISABLED",
+                    },
+                },
+                physical_resource_id=image_generation_physical_id,
+                ignore_error_codes_matching="ResourceNotFoundException",
+            ),
+            install_latest_aws_sdk=False,
+            policy=cr.AwsCustomResourcePolicy.from_sdk_calls(
+                resources=[self.kvs_stream.attr_arn]
+            ),
+        )
+        # The custom resource must run strictly after the stream (and
+        # its data) exist, and the bucket it points at must already be
+        # there too.
+        self.image_generation_config.node.add_dependency(self.kvs_stream)
+        self.image_generation_config.node.add_dependency(self.image_bucket)
 
         # ------------------------------------------------------------------
         # SNS 'fire-alerts' topic -- encrypted with the CMK.

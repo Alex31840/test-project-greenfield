@@ -442,3 +442,131 @@ class TestAcceptanceSmoke:
         template.has_resource_properties(
             "AWS::SNS::Subscription", {"Protocol": "email", "Endpoint": "ops@example.com"}
         )
+
+
+# ---------------------------------------------------------------------------
+# KVS real-time image generation configuration, applied via a custom
+# resource calling kinesisvideo:UpdateImageGenerationConfiguration
+# (documented schema, p.245-246 of the KVS Developer Guide).
+# ---------------------------------------------------------------------------
+class TestImageGenerationConfiguration:
+    @staticmethod
+    def _flatten_join_literal_parts(value) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict) and "Fn::Join" in value:
+            _, parts = value["Fn::Join"]
+            return "".join(p for p in parts if isinstance(p, str))
+        return json.dumps(value)
+
+    def _image_gen_calls(self, tpl):
+        calls = {}
+        for resource in tpl["Resources"].values():
+            if resource["Type"] != "Custom::AWS":
+                continue
+            for verb in ("Create", "Update", "Delete"):
+                value = resource["Properties"].get(verb)
+                if value is None:
+                    continue
+                flattened = self._flatten_join_literal_parts(value)
+                if (
+                    '"service":"KinesisVideo"' in flattened
+                    and '"action":"updateImageGenerationConfiguration"' in flattened
+                ):
+                    calls.setdefault(verb, []).append(flattened)
+        return calls
+
+    def test_custom_resource_applies_documented_schema_fields(self):
+        _, _, tpl = _synth(env_name="imggen")
+        calls = self._image_gen_calls(tpl)
+        assert "Create" in calls and len(calls["Create"]) == 1
+        call = calls["Create"][0]
+        assert '"StreamName":"drone-fire-detection-stream"' in call
+        assert '"Status":"ENABLED"' in call
+        assert '"SamplingInterval":200' in call
+        assert '"ImageSelectorType":"PRODUCER_TIMESTAMP"' in call
+        assert '"Format":"JPEG"' in call
+        assert '"JPEGQuality":"80"' in call
+        assert '"WidthPixels":320' in call
+        assert '"HeightPixels":240' in call
+        assert '"Uri":"s3://' in call
+
+    def test_destination_region_comes_from_stack_region_not_a_literal(self):
+        _, _, tpl = _synth(
+            construct_id="ImgGenRegionStack",
+            env_name="imggenregion",
+            env=Environment(account="444444444444", region="ap-southeast-2"),
+        )
+        calls = self._image_gen_calls(tpl)
+        call = calls["Create"][0]
+        assert '"DestinationRegion":"ap-southeast-2"' in call
+
+    def test_destination_region_uses_pseudo_parameter_when_env_agnostic(self):
+        # When no explicit env/region is supplied, the region must be
+        # threaded through as the AWS::Region pseudo-parameter (a
+        # deploy-time token), never a hardcoded literal region string.
+        _, _, tpl = _synth(env_name="imggenagnostic")
+        resources = tpl["Resources"]
+        image_gen_resource = next(
+            r
+            for r in resources.values()
+            if r["Type"] == "Custom::AWS"
+            and '"action":"updateImageGenerationConfiguration"'
+            in self._flatten_join_literal_parts(r["Properties"].get("Create"))
+        )
+        create_value = image_gen_resource["Properties"]["Create"]
+        serialized = json.dumps(create_value)
+        assert '{"Ref": "AWS::Region"}' in serialized
+
+    def test_custom_sampling_interval_is_honoured(self):
+        _, _, tpl = _synth(env_name="imggenfast", image_sampling_interval_ms=500)
+        calls = self._image_gen_calls(tpl)
+        assert '"SamplingInterval":500' in calls["Create"][0]
+
+    def test_sampling_interval_floor_is_enforced_before_synth_even_attempts_a_stack(self):
+        from reference_producer.image_gen_config import InvalidImageGenerationConfigError
+
+        with pytest.raises(InvalidImageGenerationConfigError):
+            _synth(env_name="imggentoolow", image_sampling_interval_ms=100)
+
+    def test_custom_resource_targets_the_stacks_own_kvs_stream_arn(self):
+        _, _, tpl = _synth(env_name="imggenscope")
+        policy_statements = []
+        for resource in tpl["Resources"].values():
+            if resource["Type"] != "AWS::IAM::Policy":
+                continue
+            for stmt in resource["Properties"]["PolicyDocument"]["Statement"]:
+                actions = stmt.get("Action", [])
+                actions = actions if isinstance(actions, list) else [actions]
+                if "kinesisvideo:UpdateImageGenerationConfiguration" in actions:
+                    policy_statements.append(stmt)
+        assert len(policy_statements) == 1
+        resources = policy_statements[0]["Resource"]
+        resources = resources if isinstance(resources, list) else [resources]
+        serialized = json.dumps(resources)
+        assert "DroneVideoStream" in serialized
+
+    def test_uri_points_at_the_stacks_own_image_bucket(self):
+        _, _, tpl = _synth(env_name="imggenbucket")
+        calls = self._image_gen_calls(tpl)
+        create_resource = next(
+            r
+            for r in tpl["Resources"].values()
+            if r["Type"] == "Custom::AWS"
+            and '"action":"updateImageGenerationConfiguration"'
+            in self._flatten_join_literal_parts(r["Properties"].get("Create"))
+        )
+        serialized = json.dumps(create_resource["Properties"]["Create"])
+        bucket_ids = [
+            k
+            for k, v in tpl["Resources"].items()
+            if v["Type"] == "AWS::S3::Bucket"
+        ]
+        assert len(bucket_ids) == 1
+        assert f'{{"Ref": "{bucket_ids[0]}"}}' in serialized
+
+    def test_disable_call_configured_for_on_delete(self):
+        _, _, tpl = _synth(env_name="imggendelete")
+        calls = self._image_gen_calls(tpl)
+        assert "Delete" in calls
+        assert '"Status":"DISABLED"' in calls["Delete"][0]
